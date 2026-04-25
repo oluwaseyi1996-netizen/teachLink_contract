@@ -78,10 +78,8 @@ impl Rewards {
                 let mut pool_balance: i128 =
                     env.storage().instance().get(&REWARD_POOL).unwrap_or(0);
 
-                // Checked addition to prevent overflow
-                pool_balance = pool_balance
-                    .checked_add(amount)
-                    .ok_or(RewardsError::ArithmeticOverflow)?;
+                // Safe addition to prevent overflow
+                pool_balance = Self::safe_add(pool_balance, amount)?;
 
                 env.storage().instance().set(&REWARD_POOL, &pool_balance);
 
@@ -146,16 +144,10 @@ impl Rewards {
             last_claim_timestamp: 0,
         });
 
-        // Checked addition to prevent overflow
-        user_reward.total_earned = user_reward
-            .total_earned
-            .checked_add(amount)
-            .ok_or(RewardsError::ArithmeticOverflow)?;
+        // Safe addition to prevent overflow
+        user_reward.total_earned = Self::safe_add(user_reward.total_earned, amount)?;
 
-        user_reward.pending = user_reward
-            .pending
-            .checked_add(amount)
-            .ok_or(RewardsError::ArithmeticOverflow)?;
+        user_reward.pending = Self::safe_add(user_reward.pending, amount)?;
 
         user_rewards.set(recipient.clone(), user_reward);
         env.storage().instance().set(&USER_REWARDS, &user_rewards);
@@ -166,10 +158,8 @@ impl Rewards {
             .get(&TOTAL_REWARDS_ISSUED)
             .unwrap_or(0);
 
-        // Checked addition to prevent overflow
-        total_issued = total_issued
-            .checked_add(amount)
-            .ok_or(RewardsError::ArithmeticOverflow)?;
+        // Safe addition to prevent overflow
+        total_issued = Self::safe_add(total_issued, amount)?;
 
         env.storage()
             .instance()
@@ -223,21 +213,16 @@ impl Rewards {
                 // SAFETY: TOKEN is always set during initialize_rewards
                 let token: Address = env.storage().instance().get(&TOKEN).unwrap();
 
-                // Checked addition to prevent overflow
-                user_reward.claimed = user_reward
-                    .claimed
-                    .checked_add(amount_to_claim)
-                    .ok_or(RewardsError::ArithmeticOverflow)?;
+                // Safe addition to prevent overflow
+                user_reward.claimed = Self::safe_add(user_reward.claimed, amount_to_claim)?;
 
                 user_reward.pending = 0;
                 user_reward.last_claim_timestamp = env.ledger().timestamp();
                 user_rewards.set(user.clone(), user_reward);
                 env.storage().instance().set(&USER_REWARDS, &user_rewards);
 
-                // Checked subtraction to prevent underflow
-                let new_pool_balance = pool_balance
-                    .checked_sub(amount_to_claim)
-                    .ok_or(RewardsError::InsufficientRewardPoolBalance)?;
+                // Safe subtraction to prevent underflow
+                let new_pool_balance = Self::safe_sub(pool_balance, amount_to_claim)?;
                 env.storage()
                     .instance()
                     .set(&REWARD_POOL, &new_pool_balance);
@@ -364,6 +349,19 @@ impl Rewards {
 
     /// Safely multiply two i128 values with overflow protection
     fn safe_multiply(a: i128, b: i128) -> Result<i128, RewardsError> {
+        // Additional check: if either operand is 0, return 0 early to avoid unnecessary overflow checks
+        if a == 0 || b == 0 {
+            return Ok(0);
+        }
+        
+        // Additional check: if either operand is 1, return the other operand
+        if a == 1 {
+            return Ok(b);
+        }
+        if b == 1 {
+            return Ok(a);
+        }
+        
         a.checked_mul(b).ok_or(RewardsError::ArithmeticOverflow)
     }
 
@@ -372,10 +370,45 @@ impl Rewards {
         if b == 0 {
             return Err(RewardsError::InvalidInput);
         }
+        
+        // Additional check: if dividend is 0, return 0 early
+        if a == 0 {
+            return Ok(0);
+        }
+        
+        // Additional check: if divisor is 1, return dividend
+        if b == 1 {
+            return Ok(a);
+        }
+        
         Ok(a / b)
     }
 
+    /// Safely add two i128 values with overflow protection
+    fn safe_add(a: i128, b: i128) -> Result<i128, RewardsError> {
+        // Additional check: if either operand is 0, return the other operand
+        if a == 0 {
+            return Ok(b);
+        }
+        if b == 0 {
+            return Ok(a);
+        }
+        
+        a.checked_add(b).ok_or(RewardsError::ArithmeticOverflow)
+    }
+
+    /// Safely subtract two i128 values with underflow protection
+    fn safe_sub(a: i128, b: i128) -> Result<i128, RewardsError> {
+        // Additional check: if subtracting 0, return the original value
+        if b == 0 {
+            return Ok(a);
+        }
+        
+        a.checked_sub(b).ok_or(RewardsError::InsufficientRewardPoolBalance)
+    }
+
     /// Calculate rewards based on rate and base amount with overflow protection
+    /// Rate is typically a percentage or fraction, so we use division for proper calculation
     pub fn calculate_reward_amount(base_amount: i128, rate: i128) -> Result<i128, RewardsError> {
         // Validate inputs
         if base_amount < 0 || rate < 0 {
@@ -386,8 +419,15 @@ impl Rewards {
             return Err(RewardsError::AmountExceedsMaxLimit);
         }
 
-        // Safe multiplication to prevent overflow
-        Self::safe_multiply(base_amount, rate)
+        // For reward rates, we typically calculate as: base_amount * rate / 1000
+        // This prevents overflow by doing division first when possible
+        let rate_divisor = 1000i128;
+        
+        // First check if we can safely divide the rate to reduce the magnitude
+        let adjusted_rate = Self::safe_divide(rate, rate_divisor)?;
+        
+        // Then multiply by the adjusted rate
+        Self::safe_multiply(base_amount, adjusted_rate)
     }
 }
 
@@ -604,6 +644,175 @@ mod tests {
             // Try to claim again - should fail due to no pending rewards
             let result = Rewards::claim_rewards(&env, recipient);
             assert_eq!(result, Err(RewardsError::NoPendingRewards));
+        });
+    }
+
+    #[test]
+    fn test_safe_add_edge_cases() {
+        // Test adding with zero
+        let result = Rewards::safe_add(1000, 0);
+        assert_eq!(result.unwrap(), 1000);
+        
+        let result = Rewards::safe_add(0, 1000);
+        assert_eq!(result.unwrap(), 1000);
+        
+        let result = Rewards::safe_add(0, 0);
+        assert_eq!(result.unwrap(), 0);
+
+        // Test adding with maximum values
+        let result = Rewards::safe_add(super::MAX_REWARD_AMOUNT, 1);
+        assert_eq!(result, Err(RewardsError::ArithmeticOverflow));
+        
+        let result = Rewards::safe_add(super::MAX_REWARD_AMOUNT - 1, 1);
+        assert_eq!(result.unwrap(), super::MAX_REWARD_AMOUNT);
+    }
+
+    #[test]
+    fn test_safe_sub_edge_cases() {
+        // Test subtracting zero
+        let result = Rewards::safe_sub(1000, 0);
+        assert_eq!(result.unwrap(), 1000);
+
+        // Test subtracting equal values
+        let result = Rewards::safe_sub(1000, 1000);
+        assert_eq!(result.unwrap(), 0);
+
+        // Test underflow
+        let result = Rewards::safe_sub(1000, 1001);
+        assert_eq!(result, Err(RewardsError::InsufficientRewardPoolBalance));
+    }
+
+    #[test]
+    fn test_safe_multiply_edge_cases() {
+        // Test multiplying with zero
+        let result = Rewards::safe_multiply(1000, 0);
+        assert_eq!(result.unwrap(), 0);
+        
+        let result = Rewards::safe_multiply(0, 1000);
+        assert_eq!(result.unwrap(), 0);
+
+        // Test multiplying with one
+        let result = Rewards::safe_multiply(1000, 1);
+        assert_eq!(result.unwrap(), 1000);
+        
+        let result = Rewards::safe_multiply(1, 1000);
+        assert_eq!(result.unwrap(), 1000);
+
+        // Test overflow with large values
+        let large_value = super::MAX_REWARD_AMOUNT;
+        let result = Rewards::safe_multiply(large_value, 2);
+        assert_eq!(result, Err(RewardsError::ArithmeticOverflow));
+    }
+
+    #[test]
+    fn test_safe_divide_edge_cases() {
+        // Test dividing zero
+        let result = Rewards::safe_divide(0, 1000);
+        assert_eq!(result.unwrap(), 0);
+
+        // Test dividing by one
+        let result = Rewards::safe_divide(1000, 1);
+        assert_eq!(result.unwrap(), 1000);
+
+        // Test division by zero
+        let result = Rewards::safe_divide(1000, 0);
+        assert_eq!(result, Err(RewardsError::InvalidInput));
+    }
+
+    #[test]
+    fn test_calculate_reward_amount_edge_cases() {
+        // Test with zero values
+        let result = Rewards::calculate_reward_amount(0, 1000);
+        assert_eq!(result.unwrap(), 0);
+        
+        let result = Rewards::calculate_reward_amount(1000, 0);
+        assert_eq!(result.unwrap(), 0);
+
+        // Test with rate of 1000 (should result in base_amount)
+        let result = Rewards::calculate_reward_amount(1000, 1000);
+        assert_eq!(result.unwrap(), 1000);
+
+        // Test with small rate
+        let result = Rewards::calculate_reward_amount(10000, 500); // 500/1000 = 0.5
+        assert_eq!(result.unwrap(), 5000);
+
+        // Test boundary conditions
+        let max_base = super::MAX_REWARD_AMOUNT;
+        let max_rate = super::MAX_REWARD_RATE;
+        
+        // Should succeed with maximum values
+        let result = Rewards::calculate_reward_amount(max_base, 1000);
+        assert_eq!(result.unwrap(), max_base);
+        
+        // Should fail with excessive base amount
+        let result = Rewards::calculate_reward_amount(max_base + 1, 1000);
+        assert_eq!(result, Err(RewardsError::AmountExceedsMaxLimit));
+        
+        // Should fail with excessive rate
+        let result = Rewards::calculate_reward_amount(1000, max_rate + 1);
+        assert_eq!(result, Err(RewardsError::AmountExceedsMaxLimit));
+    }
+
+    #[test]
+    fn test_multiple_accumulated_rewards_overflow_protection() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(TeachLinkBridge, ());
+
+        env.as_contract(&contract_id, || {
+            let admin = Address::generate(&env);
+            let token = Address::generate(&env);
+            Rewards::initialize_rewards(&env, token, admin).unwrap();
+
+            // Fund the pool with maximum amount
+            let funder = Address::generate(&env);
+            Rewards::fund_reward_pool(&env, funder, super::MAX_REWARD_AMOUNT).unwrap();
+
+            let recipient = Address::generate(&env);
+            let reward_type = String::from_str(&env, "test");
+
+            // Issue multiple rewards that should accumulate to maximum
+            let half_max = super::MAX_REWARD_AMOUNT / 2;
+            Rewards::issue_reward(&env, recipient.clone(), half_max, reward_type.clone()).unwrap();
+            Rewards::issue_reward(&env, recipient.clone(), half_max - 1, reward_type.clone()).unwrap();
+
+            // Try to issue one more - should fail due to insufficient pool balance
+            let result = Rewards::issue_reward(&env, recipient, 1, reward_type);
+            assert_eq!(result, Err(RewardsError::InsufficientRewardPoolBalance));
+        });
+    }
+
+    #[test]
+    fn test_claim_accumulated_rewards_overflow_protection() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(TeachLinkBridge, ());
+
+        env.as_contract(&contract_id, || {
+            let admin = Address::generate(&env);
+            let token = Address::generate(&env);
+            Rewards::initialize_rewards(&env, token, admin).unwrap();
+
+            // Fund the pool
+            let funder = Address::generate(&env);
+            let recipient = Address::generate(&env);
+            let reward_type = String::from_str(&env, "test");
+            
+            Rewards::fund_reward_pool(&env, funder, super::MAX_REWARD_AMOUNT).unwrap();
+
+            // Issue maximum reward
+            Rewards::issue_reward(&env, recipient.clone(), super::MAX_REWARD_AMOUNT, reward_type).unwrap();
+
+            // Claim should succeed
+            let result = Rewards::claim_rewards(&env, recipient.clone());
+            assert!(result.is_ok());
+
+            // Verify user rewards are properly updated
+            let user_rewards = Rewards::get_user_rewards(&env, recipient);
+            assert!(user_rewards.is_some());
+            let user_reward = user_rewards.unwrap();
+            assert_eq!(user_reward.claimed, super::MAX_REWARD_AMOUNT);
+            assert_eq!(user_reward.pending, 0);
         });
     }
 }
