@@ -362,6 +362,19 @@ impl Rewards {
             return Ok(a);
         }
         
+        // Additional overflow protection: check if the operation would overflow
+        // by comparing with MAX_REWARD_AMOUNT before performing the operation
+        if a > MAX_REWARD_AMOUNT || b > MAX_REWARD_AMOUNT {
+            // For very large numbers, do additional validation
+            // Check if the result would exceed our safe limit
+            if a > 0 && b > 0 {
+                // Both positive, check if a * b would exceed MAX_REWARD_AMOUNT
+                if a > MAX_REWARD_AMOUNT / b {
+                    return Err(RewardsError::ArithmeticOverflow);
+                }
+            }
+        }
+        
         a.checked_mul(b).ok_or(RewardsError::ArithmeticOverflow)
     }
 
