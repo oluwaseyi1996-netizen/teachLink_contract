@@ -362,7 +362,7 @@ impl Rewards {
             return Ok(a);
         }
         
-        // Additional overflow protection: check if the operation would overflow
+        // Enhanced overflow protection: check if the operation would overflow
         // by comparing with MAX_REWARD_AMOUNT before performing the operation
         if a > MAX_REWARD_AMOUNT || b > MAX_REWARD_AMOUNT {
             // For very large numbers, do additional validation
@@ -370,6 +370,20 @@ impl Rewards {
             if a > 0 && b > 0 {
                 // Both positive, check if a * b would exceed MAX_REWARD_AMOUNT
                 if a > MAX_REWARD_AMOUNT / b {
+                    return Err(RewardsError::ArithmeticOverflow);
+                }
+            } else if a < 0 && b < 0 {
+                // Both negative, check if |a * b| would exceed MAX_REWARD_AMOUNT
+                let abs_a = a.checked_abs().ok_or(RewardsError::ArithmeticOverflow)?;
+                let abs_b = b.checked_abs().ok_or(RewardsError::ArithmeticOverflow)?;
+                if abs_a > MAX_REWARD_AMOUNT / abs_b {
+                    return Err(RewardsError::ArithmeticOverflow);
+                }
+            } else {
+                // One negative, one positive - result will be negative, but we should still check magnitude
+                let abs_a = a.checked_abs().ok_or(RewardsError::ArithmeticOverflow)?;
+                let abs_b = b.checked_abs().ok_or(RewardsError::ArithmeticOverflow)?;
+                if abs_a > MAX_REWARD_AMOUNT / abs_b {
                     return Err(RewardsError::ArithmeticOverflow);
                 }
             }
@@ -421,7 +435,7 @@ impl Rewards {
     }
 
     /// Calculate rewards based on rate and base amount with overflow protection
-    /// Rate is typically a percentage or fraction, so we use division for proper calculation
+    /// Rate is typically a percentage or fraction, so we use multiplication followed by division
     pub fn calculate_reward_amount(base_amount: i128, rate: i128) -> Result<i128, RewardsError> {
         // Validate inputs
         if base_amount < 0 || rate < 0 {
@@ -433,14 +447,14 @@ impl Rewards {
         }
 
         // For reward rates, we typically calculate as: base_amount * rate / 1000
-        // This prevents overflow by doing division first when possible
+        // This prevents overflow by doing multiplication first with safe checks, then division
         let rate_divisor = 1000i128;
         
-        // First check if we can safely divide the rate to reduce the magnitude
-        let adjusted_rate = Self::safe_divide(rate, rate_divisor)?;
+        // First multiply base_amount by rate with overflow protection
+        let multiplied_result = Self::safe_multiply(base_amount, rate)?;
         
-        // Then multiply by the adjusted rate
-        Self::safe_multiply(base_amount, adjusted_rate)
+        // Then divide by the rate divisor to get the final reward amount
+        Self::safe_divide(multiplied_result, rate_divisor)
     }
 }
 
@@ -579,7 +593,7 @@ mod tests {
     fn test_calculate_reward_amount_overflow_protection() {
         // Test calculation with normal values
         let result = Rewards::calculate_reward_amount(1000, 100);
-        assert_eq!(result.unwrap(), 100000);
+        assert_eq!(result.unwrap(), 100);
 
         // Test calculation with negative base amount
         let result = Rewards::calculate_reward_amount(-1000, 100);
@@ -602,6 +616,22 @@ mod tests {
         let large_rate = 1000;
         let result = Rewards::calculate_reward_amount(large_base, large_rate);
         assert_eq!(result, Err(RewardsError::ArithmeticOverflow));
+
+        // Test edge case: maximum base with rate 1000 (should overflow)
+        let result = Rewards::calculate_reward_amount(super::MAX_REWARD_AMOUNT, 1000);
+        assert_eq!(result, Err(RewardsError::ArithmeticOverflow));
+
+        // Test edge case: rate of 1000 with reasonable base
+        let result = Rewards::calculate_reward_amount(1000000, 1000);
+        assert_eq!(result.unwrap(), 1000000);
+
+        // Test edge case: very small rate
+        let result = Rewards::calculate_reward_amount(1000000, 1);
+        assert_eq!(result.unwrap(), 1000);
+
+        // Test edge case: zero rate
+        let result = Rewards::calculate_reward_amount(1000000, 0);
+        assert_eq!(result.unwrap(), 0);
     }
 
     #[test]
@@ -711,10 +741,38 @@ mod tests {
         let result = Rewards::safe_multiply(1, 1000);
         assert_eq!(result.unwrap(), 1000);
 
-        // Test overflow with large values
+        // Test overflow with large positive values
         let large_value = super::MAX_REWARD_AMOUNT;
         let result = Rewards::safe_multiply(large_value, 2);
         assert_eq!(result, Err(RewardsError::ArithmeticOverflow));
+
+        // Test overflow with large negative values
+        let result = Rewards::safe_multiply(-large_value, -2);
+        assert_eq!(result, Err(RewardsError::ArithmeticOverflow));
+
+        // Test negative * positive (should succeed but check magnitude)
+        let result = Rewards::safe_multiply(-1000, 2);
+        assert_eq!(result.unwrap(), -2000);
+
+        // Test positive * negative (should succeed but check magnitude)
+        let result = Rewards::safe_multiply(1000, -2);
+        assert_eq!(result.unwrap(), -2000);
+
+        // Test overflow with negative * positive large values
+        let result = Rewards::safe_multiply(-large_value, 2);
+        assert_eq!(result, Err(RewardsError::ArithmeticOverflow));
+
+        // Test edge case: i128::MAX * 1
+        let result = Rewards::safe_multiply(i128::MAX, 1);
+        assert_eq!(result.unwrap(), i128::MAX);
+
+        // Test edge case: i128::MIN * 1
+        let result = Rewards::safe_multiply(i128::MIN, 1);
+        assert_eq!(result.unwrap(), i128::MIN);
+
+        // Test edge case: i128::MAX * 0
+        let result = Rewards::safe_multiply(i128::MAX, 0);
+        assert_eq!(result.unwrap(), 0);
     }
 
     #[test]
@@ -796,7 +854,7 @@ mod tests {
     }
 
     #[test]
-    fn test_claim_accumulated_rewards_overflow_protection() {
+    fn test_comprehensive_overflow_scenarios() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(TeachLinkBridge, ());
@@ -806,26 +864,56 @@ mod tests {
             let token = Address::generate(&env);
             Rewards::initialize_rewards(&env, token, admin).unwrap();
 
-            // Fund the pool
+            // Test 1: Maximum pool funding with multiple users
             let funder = Address::generate(&env);
-            let recipient = Address::generate(&env);
+            let recipient1 = Address::generate(&env);
+            let recipient2 = Address::generate(&env);
             let reward_type = String::from_str(&env, "test");
             
-            Rewards::fund_reward_pool(&env, funder, super::MAX_REWARD_AMOUNT).unwrap();
-
-            // Issue maximum reward
-            Rewards::issue_reward(&env, recipient.clone(), super::MAX_REWARD_AMOUNT, reward_type).unwrap();
-
-            // Claim should succeed
-            let result = Rewards::claim_rewards(&env, recipient.clone());
-            assert!(result.is_ok());
-
-            // Verify user rewards are properly updated
-            let user_rewards = Rewards::get_user_rewards(&env, recipient);
-            assert!(user_rewards.is_some());
-            let user_reward = user_rewards.unwrap();
-            assert_eq!(user_reward.claimed, super::MAX_REWARD_AMOUNT);
-            assert_eq!(user_reward.pending, 0);
+            // Fund pool with maximum amount
+            Rewards::fund_reward_pool(&env, funder.clone(), super::MAX_REWARD_AMOUNT).unwrap();
+            
+            // Issue rewards to multiple users that sum to maximum
+            let half_max = super::MAX_REWARD_AMOUNT / 2;
+            Rewards::issue_reward(&env, recipient1.clone(), half_max, reward_type.clone()).unwrap();
+            Rewards::issue_reward(&env, recipient2.clone(), half_max, reward_type.clone()).unwrap();
+            
+            // Should fail to issue more due to insufficient pool
+            let result = Rewards::issue_reward(&env, recipient1, 1, reward_type);
+            assert_eq!(result, Err(RewardsError::InsufficientRewardPoolBalance));
+            
+            // Test 2: Claim rewards to verify pool balance updates correctly
+            Rewards::claim_rewards(&env, recipient2).unwrap();
+            
+            // Pool should now have half_max available
+            let pool_balance = Rewards::get_reward_pool_balance(&env);
+            assert_eq!(pool_balance, half_max);
+            
+            // Test 3: Try to fund pool with amount that would cause overflow
+            let result = Rewards::fund_reward_pool(&env, funder, super::MAX_REWARD_AMOUNT);
+            assert_eq!(result, Err(RewardsError::InsufficientRewardPoolBalance));
         });
+    }
+
+    #[test]
+    fn test_boundary_value_analysis() {
+        // Test boundary values around MAX_REWARD_AMOUNT
+        let max_val = super::MAX_REWARD_AMOUNT;
+        
+        // Test exactly at boundary
+        let result = Rewards::safe_add(max_val - 1, 1);
+        assert_eq!(result.unwrap(), max_val);
+        
+        // Test just over boundary
+        let result = Rewards::safe_add(max_val, 1);
+        assert_eq!(result, Err(RewardsError::ArithmeticOverflow));
+        
+        // Test multiplication boundary
+        let sqrt_max = (max_val as f64).sqrt() as i128;
+        let result = Rewards::safe_multiply(sqrt_max, sqrt_max);
+        assert!(result.is_ok());
+        
+        let result = Rewards::safe_multiply(sqrt_max + 1, sqrt_max + 1);
+        assert_eq!(result, Err(RewardsError::ArithmeticOverflow));
     }
 }
